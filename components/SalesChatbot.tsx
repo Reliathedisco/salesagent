@@ -28,6 +28,10 @@ export default function SalesChatbot() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Refs for smooth streaming without per-chunk re-renders
+  const rafRef = useRef<number | null>(null);
+  const streamContentRef = useRef('');
+  const messageCountRef = useRef(0);
 
   // Initialize session and restore state from localStorage
   useEffect(() => {
@@ -68,12 +72,12 @@ export default function SalesChatbot() {
     };
   }, []);
 
-  // Persist messages to localStorage
+  // Persist messages to localStorage — skip during streaming to avoid per-chunk writes
   useEffect(() => {
-    if (mounted && messages.length > 0) {
+    if (mounted && messages.length > 0 && !isStreaming) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
     }
-  }, [messages, mounted]);
+  }, [messages, mounted, isStreaming]);
 
   // Persist lead to localStorage
   useEffect(() => {
@@ -82,9 +86,13 @@ export default function SalesChatbot() {
     }
   }, [lead, mounted]);
 
-  // Auto-scroll to bottom
+  // Auto-scroll: smooth only when a new message is added, instant during streaming
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const newCount = messages.length;
+    if (newCount !== messageCountRef.current) {
+      messageCountRef.current = newCount;
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [messages]);
 
   const qualifyLead = useCallback(
@@ -144,7 +152,23 @@ export default function SalesChatbot() {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
-        let fullResponse = '';
+        streamContentRef.current = '';
+
+        // Flush accumulated stream content to React state at ~60fps
+        const scheduleFlush = () => {
+          if (rafRef.current !== null) return;
+          rafRef.current = requestAnimationFrame(() => {
+            rafRef.current = null;
+            const content = streamContentRef.current;
+            setMessages((prev) => {
+              const updated = [...prev];
+              updated[updated.length - 1] = { role: 'assistant', content };
+              return updated;
+            });
+            // Keep bottom visible without re-triggering smooth scroll
+            messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
+          });
+        };
 
         while (true) {
           const { done, value } = await reader.read();
@@ -162,29 +186,37 @@ export default function SalesChatbot() {
             try {
               const parsed = JSON.parse(data);
               if (parsed.error) {
-                fullResponse += parsed.error;
+                streamContentRef.current += parsed.error;
               } else if (parsed.text) {
-                fullResponse += parsed.text;
+                streamContentRef.current += parsed.text;
               }
-
-              setMessages((prev) => {
-                const updated = [...prev];
-                updated[updated.length - 1] = {
-                  role: 'assistant',
-                  content: fullResponse,
-                };
-                return updated;
-              });
+              scheduleFlush();
             } catch {
               // Skip malformed JSON chunks
             }
           }
         }
 
+        // Cancel any pending RAF and do a final flush
+        if (rafRef.current !== null) {
+          cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+        }
+        const fullResponse = streamContentRef.current;
+        setMessages((prev) => {
+          const updated = [...prev];
+          updated[updated.length - 1] = { role: 'assistant', content: fullResponse };
+          return updated;
+        });
+
         // Qualify lead after stream completes
         const finalMessages = [...updatedMessages, { role: 'assistant' as const, content: fullResponse }];
         qualifyLead(finalMessages, sessionId);
       } catch (error) {
+        if (rafRef.current !== null) {
+          cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+        }
         if (error instanceof DOMException && error.name === 'AbortError') {
           return;
         }

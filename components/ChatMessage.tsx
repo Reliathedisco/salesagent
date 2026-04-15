@@ -19,6 +19,7 @@ export default function ChatMessage({ message, isStreaming }: ChatMessageProps) 
             ? 'bg-blue-600 text-white rounded-br-sm'
             : 'bg-gray-100 text-gray-900 rounded-bl-sm'
         }`}
+        style={{ willChange: isStreaming ? 'contents' : 'auto' }}
       >
         {isEmpty && isStreaming ? (
           <span className="inline-flex gap-1">
