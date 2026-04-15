@@ -28,10 +28,14 @@ export default function SalesChatbot() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  // Refs for smooth streaming without per-chunk re-renders
-  const rafRef = useRef<number | null>(null);
-  const streamContentRef = useRef('');
+  // Typewriter queue: decouples display from network delivery
+  const displayQueueRef = useRef('');       // buffered chars waiting to render
+  const fullReceivedRef = useRef('');       // full content received (for qualification)
+  const networkDoneRef = useRef(false);     // true once HTTP stream is fully received
+  const drainFrameRef = useRef<number | null>(null);
   const messageCountRef = useRef(0);
+  // chars rendered per animation frame — tune for speed feel
+  const CHARS_PER_FRAME = 6;
 
   // Initialize session and restore state from localStorage
   useEffect(() => {
@@ -120,28 +124,66 @@ export default function SalesChatbot() {
 
       setShowQuickReplies(false);
       const userMessage: ChatMessageType = { role: 'user', content: text };
-      const assistantMessage: ChatMessageType = {
-        role: 'assistant',
-        content: '',
-      };
-
       const updatedMessages = [...messages, userMessage];
-      setMessages([...updatedMessages, assistantMessage]);
+      setMessages([...updatedMessages, { role: 'assistant', content: '' }]);
       setInput('');
       setIsStreaming(true);
+
+      // Reset queue state
+      displayQueueRef.current = '';
+      fullReceivedRef.current = '';
+      networkDoneRef.current = false;
 
       abortControllerRef.current?.abort();
       const abortController = new AbortController();
       abortControllerRef.current = abortController;
 
+      // Drain loop: pulls chars from queue at a steady CHARS_PER_FRAME rate.
+      // Runs until queue is empty AND network stream is done.
+      const startDrain = () => {
+        if (drainFrameRef.current !== null) return;
+
+        const drain = () => {
+          if (displayQueueRef.current.length > 0) {
+            const take = Math.min(CHARS_PER_FRAME, displayQueueRef.current.length);
+            const chars = displayQueueRef.current.slice(0, take);
+            displayQueueRef.current = displayQueueRef.current.slice(take);
+
+            setMessages((prev) => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              updated[updated.length - 1] = {
+                role: 'assistant',
+                content: last.content + chars,
+              };
+              return updated;
+            });
+            messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
+            drainFrameRef.current = requestAnimationFrame(drain);
+          } else if (networkDoneRef.current) {
+            // Queue empty and stream fully received — we're done
+            drainFrameRef.current = null;
+            setIsStreaming(false);
+            const fullResponse = fullReceivedRef.current;
+            const finalMessages = [
+              ...updatedMessages,
+              { role: 'assistant' as const, content: fullResponse },
+            ];
+            qualifyLead(finalMessages, sessionId);
+          } else {
+            // Queue temporarily empty but stream still in flight — keep polling
+            drainFrameRef.current = requestAnimationFrame(drain);
+          }
+        };
+
+        drainFrameRef.current = requestAnimationFrame(drain);
+      };
+
       try {
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: updatedMessages,
-            sessionId,
-          }),
+          body: JSON.stringify({ messages: updatedMessages, sessionId }),
           signal: abortController.signal,
         });
 
@@ -152,23 +194,8 @@ export default function SalesChatbot() {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
-        streamContentRef.current = '';
 
-        // Flush accumulated stream content to React state at ~60fps
-        const scheduleFlush = () => {
-          if (rafRef.current !== null) return;
-          rafRef.current = requestAnimationFrame(() => {
-            rafRef.current = null;
-            const content = streamContentRef.current;
-            setMessages((prev) => {
-              const updated = [...prev];
-              updated[updated.length - 1] = { role: 'assistant', content };
-              return updated;
-            });
-            // Keep bottom visible without re-triggering smooth scroll
-            messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
-          });
-        };
+        startDrain();
 
         while (true) {
           const { done, value } = await reader.read();
@@ -185,41 +212,27 @@ export default function SalesChatbot() {
 
             try {
               const parsed = JSON.parse(data);
-              if (parsed.error) {
-                streamContentRef.current += parsed.error;
-              } else if (parsed.text) {
-                streamContentRef.current += parsed.text;
+              const token: string = parsed.text ?? parsed.error ?? '';
+              if (token) {
+                displayQueueRef.current += token;
+                fullReceivedRef.current += token;
               }
-              scheduleFlush();
             } catch {
-              // Skip malformed JSON chunks
+              // Skip malformed chunks
             }
           }
         }
 
-        // Cancel any pending RAF and do a final flush
-        if (rafRef.current !== null) {
-          cancelAnimationFrame(rafRef.current);
-          rafRef.current = null;
-        }
-        const fullResponse = streamContentRef.current;
-        setMessages((prev) => {
-          const updated = [...prev];
-          updated[updated.length - 1] = { role: 'assistant', content: fullResponse };
-          return updated;
-        });
-
-        // Qualify lead after stream completes
-        const finalMessages = [...updatedMessages, { role: 'assistant' as const, content: fullResponse }];
-        qualifyLead(finalMessages, sessionId);
+        // Signal drain loop that no more network data is coming
+        networkDoneRef.current = true;
       } catch (error) {
-        if (rafRef.current !== null) {
-          cancelAnimationFrame(rafRef.current);
-          rafRef.current = null;
+        if (drainFrameRef.current !== null) {
+          cancelAnimationFrame(drainFrameRef.current);
+          drainFrameRef.current = null;
         }
-        if (error instanceof DOMException && error.name === 'AbortError') {
-          return;
-        }
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+
+        setIsStreaming(false);
         setMessages((prev) => {
           const updated = [...prev];
           updated[updated.length - 1] = {
@@ -228,11 +241,9 @@ export default function SalesChatbot() {
           };
           return updated;
         });
-      } finally {
-        setIsStreaming(false);
       }
     },
-    [isStreaming, messages, sessionId, qualifyLead]
+    [isStreaming, messages, sessionId, qualifyLead, CHARS_PER_FRAME]
   );
 
   function handleSubmit(e: FormEvent) {
